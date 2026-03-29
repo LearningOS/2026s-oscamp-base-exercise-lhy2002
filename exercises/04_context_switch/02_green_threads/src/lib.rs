@@ -51,7 +51,7 @@ pub enum ThreadState {
 struct GreenThread {
     ctx: TaskContext,
     state: ThreadState,
-    _stack: Option<Vec<u8>>,
+    stack: Option<Vec<u8>>,
     /// User entry; taken once when the thread is first scheduled and passed to `thread_wrapper`.
     entry: Option<extern "C" fn()>,
 }
@@ -120,7 +120,7 @@ impl Scheduler {
         let main_thread = GreenThread {
             ctx: TaskContext::default(),
             state: ThreadState::Running,
-            _stack: None,
+            stack: None,
             entry: None,
         };
 
@@ -137,7 +137,22 @@ impl Scheduler {
     ///    `sp` must be 16-byte aligned (e.g. `(stack_top - 16) & !15` to leave headroom).
     /// 3. Push a `GreenThread` with this context, state `Ready`, and `entry` stored for the wrapper to call.
     pub fn spawn(&mut self, entry: extern "C" fn()) {
-        todo!("alloc stack, init ctx with ra=thread_wrapper and aligned sp, push GreenThread(Ready, entry)")
+        // todo!("alloc stack, init ctx with ra=thread_wrapper and aligned sp, push GreenThread(Ready, entry)")
+        let mut stack = vec![0u8; STACK_SIZE];
+        let stack_top = stack.as_mut_ptr() as usize + STACK_SIZE;
+        
+        let mut ctx = TaskContext::default();
+        ctx.ra = thread_wrapper as u64;
+        ctx.sp = ((stack_top - 16) & !15) as u64;
+        
+        let green_thread = GreenThread {
+            ctx,
+            state: ThreadState::Ready,
+            stack: Some(stack),
+            entry: Some(entry),
+        };
+        
+        self.threads.push(green_thread);
     }
 
     /// Run the scheduler until all threads (except the main one) are `Finished`.
@@ -146,12 +161,76 @@ impl Scheduler {
     /// 2. Loop: if all threads in `threads[1..]` are `Finished`, break; otherwise call `schedule_next()` (which may switch away and later return).
     /// 3. Clear `SCHEDULER` when done.
     pub fn run(&mut self) {
-        todo!("set SCHEDULER to self, loop until threads[1..] all Finished, call schedule_next, then clear SCHEDULER")
+        // todo!("set SCHEDULER to self, loop until threads[1..] all Finished, call schedule_next, then clear SCHEDULER")
+		unsafe {
+            // Set global scheduler pointer
+            SCHEDULER = self as *mut Scheduler;
+        }
+        
+        // Loop until all non-main threads are finished
+        loop {
+            let all_finished = self.threads[1..].iter().all(|t| t.state == ThreadState::Finished);
+            if all_finished {
+                break;
+            }
+            self.schedule_next();
+        }
+        
+        unsafe {
+            // Clear global scheduler pointer
+            SCHEDULER = std::ptr::null_mut();
+        }
     }
 
     /// Find the next ready thread (starting from `current + 1` round-robin), mark current as `Ready` (if not `Finished`), mark next as `Running`, set `CURRENT_THREAD_ENTRY` if the next thread has an entry, then switch to it.
     fn schedule_next(&mut self) {
-        todo!("round-robin find next Ready, set current Ready (if not Finished), next Running, CURRENT_THREAD_ENTRY, then switch_context")
+        // todo!("round-robin find next Ready, set current Ready (if not Finished), next Running, CURRENT_THREAD_ENTRY, then switch_context")
+		 // Save current thread state if it's not finished
+        if self.threads[self.current].state != ThreadState::Finished {
+            self.threads[self.current].state = ThreadState::Ready;
+        }
+        
+        // Find next ready thread (round-robin)
+        let num_threads = self.threads.len();
+        let mut next = (self.current + 1) % num_threads;
+        while next != self.current && self.threads[next].state != ThreadState::Ready {
+            next = (next + 1) % num_threads;
+        }
+        
+        // If we found a ready thread, switch to it
+        if self.threads[next].state == ThreadState::Ready {
+            // Mark next thread as running
+            self.threads[next].state = ThreadState::Running;
+            
+            // Set entry for thread wrapper if this is a new thread
+            if let Some(entry) = self.threads[next].entry.take() {
+                unsafe {
+                    CURRENT_THREAD_ENTRY = Some(entry);
+                }
+            }
+
+			// Use split_at_mut to get non-overlapping mutable references
+			let (left, right) = self.threads.split_at_mut(self.current.max(next));
+			
+			let (old_ctx_ptr, new_ctx_ptr) = if self.current < next {
+				// current is in left, next is in right
+				let old_ctx = &mut left[self.current].ctx;
+				let new_ctx = &right[0].ctx;
+				(old_ctx, new_ctx)
+			} else {
+				// next is in left, current is in right
+				let old_ctx = &mut right[0].ctx;
+				let new_ctx = &left[next].ctx;
+				(old_ctx, new_ctx)
+			};
+            
+            unsafe {
+                switch_context(old_ctx_ptr, new_ctx_ptr);
+            }
+            
+            // Update current thread index after switching back
+            self.current = next;
+        }
     }
 }
 

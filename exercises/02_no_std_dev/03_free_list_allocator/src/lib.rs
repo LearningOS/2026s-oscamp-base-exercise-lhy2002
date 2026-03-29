@@ -119,7 +119,118 @@ unsafe impl GlobalAlloc for FreeListAllocator {
         // TODO: Step 2 — no suitable block in free_list, allocate from bump region
         //
         // Same logic as 02_bump_allocator's alloc
-        todo!()
+		        // Step 1: traverse free_list, find a suitable block (first-fit)
+        let mut prev_ptr: *mut FreeBlock = null_mut();
+        let mut curr = self.free_list_head();
+        
+        while !curr.is_null() {
+            let block = &*curr;
+            
+            // Check if current block meets size and alignment requirements
+            let block_addr = curr as usize;
+            let aligned_addr = block_addr.checked_add(align - 1)
+                .map(|x| x & !(align - 1))
+                .unwrap_or(0);
+            
+            let padding = aligned_addr - block_addr;
+            
+            if block.size >= size + padding {
+                
+                if prev_ptr.is_null() {
+                    self.set_free_list_head(block.next);
+                } else {
+                    (*prev_ptr).next = block.next;
+                }
+                
+                // Calculate the actual allocation address
+                let alloc_addr = if padding > 0 {
+                    // Need to split off the padding area
+                    // If padding is large enough, we can create a new free block
+                    if padding >= core::mem::size_of::<FreeBlock>() {
+                        // Create a free block for the padding area
+                        let padding_block = curr as usize;
+                        (padding_block as *mut FreeBlock).write(FreeBlock {
+                            size: padding,
+                            next: curr, // This will be fixed below
+                        });
+                        
+                        let new_block_addr = padding_block + padding;
+                        let new_block = new_block_addr as *mut FreeBlock;
+                        
+                        new_block.write(FreeBlock {
+                            size: block.size - padding,
+                            next: block.next,
+                        });
+                        
+                        let padding_block_ptr = padding_block as *mut FreeBlock;
+                        if prev_ptr.is_null() {
+                            self.set_free_list_head(padding_block_ptr);
+                        } else {
+                            (*prev_ptr).next = padding_block_ptr;
+                        }
+                        padding_block_ptr.write(FreeBlock {
+                            size: padding,
+                            next: new_block,
+                        });
+                        
+                        return aligned_addr as *mut u8;
+                    }
+                    aligned_addr as *mut u8
+                } else {
+                    curr as *mut u8
+                };
+                
+                // Check if we need to split off excess space
+                let remaining = block.size - size - padding;
+                if remaining >= core::mem::size_of::<FreeBlock>() {
+                    // Split: create a new free block after allocation
+                    let alloc_end = alloc_addr as usize + size;
+                    let remaining_block = alloc_end as *mut FreeBlock;
+                    remaining_block.write(FreeBlock {
+                        size: remaining,
+                        next: block.next,
+                    });
+                    
+                    // Update the free list to include the remaining block
+                    if prev_ptr.is_null() {
+                        self.set_free_list_head(remaining_block);
+                    } else {
+                        (*prev_ptr).next = remaining_block;
+                    }
+                }
+                
+                return alloc_addr as *mut u8;
+            }
+            
+            prev_ptr = curr;
+            curr = block.next;
+        }
+
+        // Step 2: no suitable block in free_list, allocate from bump region
+        
+        let bump_next = self.bump_next.load(core::sync::atomic::Ordering::Relaxed);
+        
+        // Align the bump pointer
+        let aligned_bump = bump_next.checked_add(align - 1)
+            .map(|x| x & !(align - 1))
+            .unwrap_or(bump_next); // 如果对齐计算失败，使用原地址
+        
+        // 检查加法是否溢出
+        let new_bump = match aligned_bump.checked_add(size) {
+            Some(v) => v,
+            None => return null_mut(), // 溢出，分配失败
+        };
+        
+        // Check if we have enough space
+        if new_bump > self.heap_end {
+            return null_mut(); // Out of memory
+        }
+        
+        // Update bump pointer
+        self.bump_next.store(new_bump, core::sync::atomic::Ordering::Relaxed);
+        
+        // Return the aligned pointer
+        aligned_bump as *mut u8
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -131,7 +242,24 @@ unsafe impl GlobalAlloc for FreeListAllocator {
         // 1. Cast ptr to *mut FreeBlock
         // 2. Write FreeBlock { size, next: current list head }
         // 3. Update free_list head to ptr
-        todo!()
+
+		// Insert the freed block at the head of free_list
+		
+		// 1. Cast ptr to *mut FreeBlock
+		let free_block = ptr as *mut FreeBlock;
+		
+		// 2. Write FreeBlock { size, next: current list head }
+		// 获取当前空闲链表头
+		let current_head = self.free_list_head();
+		
+		// 在释放的内存块头部写入 FreeBlock 结构
+		free_block.write(FreeBlock {
+			size,
+			next: current_head,
+    });
+    
+    // 3. Update free_list head to ptr
+    self.set_free_list_head(free_block);
     }
 }
 
