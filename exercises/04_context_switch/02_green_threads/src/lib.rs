@@ -51,7 +51,7 @@ pub enum ThreadState {
 struct GreenThread {
     ctx: TaskContext,
     state: ThreadState,
-    stack: Option<Vec<u8>>,
+    _stack: Option<Vec<u8>>,
     /// User entry; taken once when the thread is first scheduled and passed to `thread_wrapper`.
     entry: Option<extern "C" fn()>,
 }
@@ -120,7 +120,7 @@ impl Scheduler {
         let main_thread = GreenThread {
             ctx: TaskContext::default(),
             state: ThreadState::Running,
-            stack: None,
+            _stack: None,
             entry: None,
         };
 
@@ -138,8 +138,8 @@ impl Scheduler {
     /// 3. Push a `GreenThread` with this context, state `Ready`, and `entry` stored for the wrapper to call.
     pub fn spawn(&mut self, entry: extern "C" fn()) {
         // todo!("alloc stack, init ctx with ra=thread_wrapper and aligned sp, push GreenThread(Ready, entry)")
-        let mut stack = vec![0u8; STACK_SIZE];
-        let stack_top = stack.as_mut_ptr() as usize + STACK_SIZE;
+        let mut _stack = vec![0u8; STACK_SIZE];
+        let stack_top = _stack.as_mut_ptr() as usize + STACK_SIZE;
         
         let mut ctx = TaskContext::default();
         ctx.ra = thread_wrapper as u64;
@@ -148,7 +148,7 @@ impl Scheduler {
         let green_thread = GreenThread {
             ctx,
             state: ThreadState::Ready,
-            stack: Some(stack),
+            _stack: Some(_stack),
             entry: Some(entry),
         };
         
@@ -186,51 +186,35 @@ impl Scheduler {
     fn schedule_next(&mut self) {
         // todo!("round-robin find next Ready, set current Ready (if not Finished), next Running, CURRENT_THREAD_ENTRY, then switch_context")
 		 // Save current thread state if it's not finished
-        if self.threads[self.current].state != ThreadState::Finished {
-            self.threads[self.current].state = ThreadState::Ready;
-        }
-        
-        // Find next ready thread (round-robin)
-        let num_threads = self.threads.len();
-        let mut next = (self.current + 1) % num_threads;
-        while next != self.current && self.threads[next].state != ThreadState::Ready {
-            next = (next + 1) % num_threads;
-        }
-        
-        // If we found a ready thread, switch to it
-        if self.threads[next].state == ThreadState::Ready {
-            // Mark next thread as running
-            self.threads[next].state = ThreadState::Running;
-            
-            // Set entry for thread wrapper if this is a new thread
-            if let Some(entry) = self.threads[next].entry.take() {
-                unsafe {
-                    CURRENT_THREAD_ENTRY = Some(entry);
-                }
-            }
+		let num_threads = self.threads.len();
+		let mut next_idx = (self.current + 1) % num_threads;
+		while next_idx != self.current && self.threads[next_idx].state != ThreadState::Ready {
+			next_idx = (next_idx + 1) % num_threads;
+		}
 
-			// Use split_at_mut to get non-overlapping mutable references
-			let (left, right) = self.threads.split_at_mut(self.current.max(next));
-			
-			let (old_ctx_ptr, new_ctx_ptr) = if self.current < next {
-				// current is in left, next is in right
-				let old_ctx = &mut left[self.current].ctx;
-				let new_ctx = &right[0].ctx;
-				(old_ctx, new_ctx)
-			} else {
-				// next is in left, current is in right
-				let old_ctx = &mut right[0].ctx;
-				let new_ctx = &left[next].ctx;
-				(old_ctx, new_ctx)
-			};
-            
-            unsafe {
-                switch_context(old_ctx_ptr, new_ctx_ptr);
-            }
-            
-            // Update current thread index after switching back
-            self.current = next;
-        }
+		if self.threads[next_idx].state != ThreadState::Ready {
+			return;
+		}
+
+		let old_idx = self.current;
+		if self.threads[old_idx].state == ThreadState::Running {
+			self.threads[old_idx].state = ThreadState::Ready;
+		}
+		
+		self.threads[next_idx].state = ThreadState::Running;
+		self.current = next_idx; 
+
+		if let Some(entry) = self.threads[next_idx].entry.take() {
+			unsafe {
+				CURRENT_THREAD_ENTRY = Some(entry);
+			}
+		}
+
+		unsafe {
+			let old_ctx_ptr = self.threads[old_idx].ctx.as_mut_ptr();
+			let new_ctx_ptr = self.threads[next_idx].ctx.as_ptr();
+			switch_context(&mut *old_ctx_ptr, &*new_ctx_ptr);
+		}
     }
 }
 
